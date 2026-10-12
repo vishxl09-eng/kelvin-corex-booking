@@ -22,9 +22,6 @@ const PUBLIC_SITE_URL =
   process.env.PUBLIC_SITE_URL || 'https://kelvin-corex-booking.vercel.app';
 
 const TIMEZONE = 'Asia/Kolkata';
-
-// In-memory login tokens. On serverless hosting, sessions may reset
-// when an instance restarts; log in again if that happens.
 const ownerTokens = new Set();
 
 app.disable('x-powered-by');
@@ -40,11 +37,26 @@ function safeEqual(a, b) {
     crypto.timingSafeEqual(first, second);
 }
 
-function requireOwner(req, res, next) {
+function getToken(req) {
   const auth = String(req.headers.authorization || '');
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7);
 
-  if (!token || !ownerTokens.has(token)) {
+  // Backward compatibility with the previous dashboard.
+  const password = String(req.headers['x-admin-password'] || '');
+  if (ADMIN_PASSWORD && password && safeEqual(password, ADMIN_PASSWORD)) {
+    return '__legacy_password_auth__';
+  }
+
+  return '';
+}
+
+function requireOwner(req, res, next) {
+  const token = getToken(req);
+
+  if (
+    !token ||
+    (token !== '__legacy_password_auth__' && !ownerTokens.has(token))
+  ) {
     return res.status(401).json({
       success: false,
       error: 'Please log in as the salon owner.'
@@ -58,35 +70,24 @@ function normalizeDate(value) {
   if (value == null) return '';
 
   const str = String(value).trim();
-
-  // The HTML date input sends YYYY-MM-DD. Preserve it as-is.
   const match = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
   if (match) {
     const year = Number(match[1]);
     const month = Number(match[2]);
     const day = Number(match[3]);
     const check = new Date(Date.UTC(year, month - 1, day));
 
-    if (
-      check.getUTCFullYear() === year &&
+    return check.getUTCFullYear() === year &&
       check.getUTCMonth() === month - 1 &&
-      check.getUTCDate() === day
-    ) {
-      return str;
-    }
-    return '';
+      check.getUTCDate() === day ? str : '';
   }
 
-  // For ISO timestamps, keep the date portion rather than shifting
-  // the calendar date through the server's local timezone.
   const iso = str.match(/^(\d{4}-\d{2}-\d{2})T/);
   if (iso) return normalizeDate(iso[1]);
 
-  // Handle legacy Google Sheets date serialization.
   const legacy = str.match(/^(\d{4})-(\d{2})-(\d{2})\s/);
-  if (legacy) return normalizeDate(
-    `${legacy[1]}-${legacy[2]}-${legacy[3]}`
-  );
+  if (legacy) return normalizeDate(`${legacy[1]}-${legacy[2]}-${legacy[3]}`);
 
   return '';
 }
@@ -95,34 +96,28 @@ function normalizeTime(value) {
   if (value == null) return '';
 
   const str = String(value).trim();
+  let match = str.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
 
-  // Preferred storage format: 14:00, 09:30, etc.
-  const twentyFour = str.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
-  if (twentyFour) {
-    const hour = Number(twentyFour[1]);
-    const minute = Number(twentyFour[2]);
+  if (match) {
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
 
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-      return '';
-    }
+    if (hour > 23 || minute > 59) return '';
 
     return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
   }
 
-  // Handle legacy Sheets values such as 1899-12-30T14:00:00.000Z.
-  // This reads the clock portion only; it does not convert timezones.
-  const legacy = str.match(/^1899-12-30T(\d{2}):(\d{2})/);
-  if (legacy) return `${legacy[1]}:${legacy[2]}`;
+  // Legacy Google Sheets time serialization.
+  match = str.match(/^1899-12-30T(\d{2}):(\d{2})/);
+  if (match) return `${match[1]}:${match[2]}`;
 
-  // Handle strings such as 2:00 PM.
-  const twelve = str.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-  if (twelve) {
-    let hour = Number(twelve[1]);
-    const minute = Number(twelve[2]);
-    const meridiem = twelve[3].toUpperCase();
+  match = str.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (match) {
+    let hour = Number(match[1]);
+    const minute = Number(match[2]);
+    const meridiem = match[3].toUpperCase();
 
     if (hour < 1 || hour > 12 || minute > 59) return '';
-
     if (meridiem === 'AM' && hour === 12) hour = 0;
     if (meridiem === 'PM' && hour !== 12) hour += 12;
 
@@ -137,14 +132,13 @@ function displayDate(value) {
   if (!dateStr) return 'Date unavailable';
 
   const [year, month, day] = dateStr.split('-').map(Number);
-  const date = new Date(Date.UTC(year, month - 1, day));
 
   return new Intl.DateTimeFormat('en-GB', {
     day: 'numeric',
     month: 'long',
     year: 'numeric',
     timeZone: 'UTC'
-  }).format(date);
+  }).format(new Date(Date.UTC(year, month - 1, day)));
 }
 
 function displayTime(value) {
@@ -152,14 +146,13 @@ function displayTime(value) {
   if (!time) return 'Time unavailable';
 
   const [hour, minute] = time.split(':').map(Number);
-  const date = new Date(Date.UTC(2000, 0, 1, hour, minute));
 
   return new Intl.DateTimeFormat('en-IN', {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
     timeZone: 'UTC'
-  }).format(date).toLowerCase();
+  }).format(new Date(Date.UTC(2000, 0, 1, hour, minute))).toLowerCase();
 }
 
 function normalizeAppointment(appointment) {
@@ -182,32 +175,20 @@ function makeWhatsAppLink(phone, message) {
 function appointmentMessage(appointment, approved = true) {
   const a = normalizeAppointment(appointment);
 
-  if (approved) {
-    return [
-      `Hi ${a.name || 'there'},`,
-      '',
-      `Your appointment at *${SALON_NAME}* is *CONFIRMED!* ✅`,
-      '',
-      `*Service:* ${a.service || 'Salon service'}`,
-      `*Date:* ${displayDate(a.date)}`,
-      `*Time:* ${displayTime(a.time)}`,
-      '',
-      `Thank you for choosing ${SALON_NAME}. We look forward to seeing you!`,
-      '',
-      `*Team ${SALON_NAME}*`
-    ].join('\n');
-  }
-
   return [
     `Hi ${a.name || 'there'},`,
     '',
-    `Unfortunately, your appointment request at *${SALON_NAME}* could not be approved.`,
+    approved
+      ? `Your appointment at *${SALON_NAME}* is *CONFIRMED!* ✅`
+      : `Unfortunately, your appointment request at *${SALON_NAME}* could not be approved.`,
     '',
     `*Service:* ${a.service || 'Salon service'}`,
     `*Date:* ${displayDate(a.date)}`,
     `*Time:* ${displayTime(a.time)}`,
     '',
-    'Please contact the salon to choose another available time.',
+    approved
+      ? `Thank you for choosing ${SALON_NAME}. We look forward to seeing you!`
+      : 'Please contact the salon to choose another available time.',
     '',
     `*Team ${SALON_NAME}*`
   ].join('\n');
@@ -258,6 +239,7 @@ async function sheetsRequest(action, data = {}) {
 
 function publicError(res, error, status = 500) {
   console.error(error);
+
   return res.status(status).json({
     success: false,
     error: status === 500
@@ -266,16 +248,24 @@ function publicError(res, error, status = 500) {
   });
 }
 
+function formatAppointments(list) {
+  return (list || []).map(item => {
+    const a = normalizeAppointment(item);
+
+    return {
+      ...a,
+      dateText: displayDate(a.date),
+      timeText: displayTime(a.time)
+    };
+  });
+}
+
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    salon: SALON_NAME,
-    timezone: TIMEZONE
-  });
+  res.json({ ok: true, salon: SALON_NAME, timezone: TIMEZONE });
 });
 
-// Public salon settings
+// Public settings
 app.get('/api/config', (req, res) => {
   res.json({
     salonName: SALON_NAME,
@@ -285,7 +275,7 @@ app.get('/api/config', (req, res) => {
   });
 });
 
-// Create a booking request
+// Public booking creation
 app.post('/api/appointments', async (req, res) => {
   try {
     const name = String(req.body.name || '').trim();
@@ -295,17 +285,11 @@ app.post('/api/appointments', async (req, res) => {
     const time = normalizeTime(req.body.time);
 
     if (!name || name.length > 80) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please enter a valid name.'
-      });
+      return res.status(400).json({ success: false, error: 'Please enter a valid name.' });
     }
 
     if (!/^(91)?[6-9]\d{9}$/.test(phone)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please enter a valid Indian mobile number.'
-      });
+      return res.status(400).json({ success: false, error: 'Please enter a valid Indian mobile number.' });
     }
 
     const allowedServices = [
@@ -317,29 +301,19 @@ app.post('/api/appointments', async (req, res) => {
     ];
 
     if (!allowedServices.includes(service)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please select a valid service.'
-      });
+      return res.status(400).json({ success: false, error: 'Please select a valid service.' });
     }
 
     if (!date || !time) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please select a valid date and time.'
-      });
+      return res.status(400).json({ success: false, error: 'Please select a valid date and time.' });
     }
 
     const [year, month, day] = date.split('-').map(Number);
     const [hour, minute] = time.split(':').map(Number);
     const requested = new Date(year, month - 1, day, hour, minute);
-    const now = new Date();
 
-    if (requested.getTime() < now.getTime()) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please select a future date and time.'
-      });
+    if (requested.getTime() < Date.now()) {
+      return res.status(400).json({ success: false, error: 'Please select a future date and time.' });
     }
 
     if (hour < OPEN_HOUR || hour > CLOSE_HOUR ||
@@ -364,11 +338,6 @@ app.post('/api/appointments', async (req, res) => {
 
     await sheetsRequest('create', { appointment });
 
-    const ownerLink = makeWhatsAppLink(
-      OWNER_WHATSAPP,
-      ownerNotificationMessage(appointment)
-    );
-
     return res.status(201).json({
       success: true,
       appointment: {
@@ -376,7 +345,10 @@ app.post('/api/appointments', async (req, res) => {
         dateText: displayDate(date),
         timeText: displayTime(time)
       },
-      ownerWhatsAppLink: ownerLink
+      ownerWhatsAppLink: makeWhatsAppLink(
+        OWNER_WHATSAPP,
+        ownerNotificationMessage(appointment)
+      )
     });
   } catch (error) {
     return publicError(res, error);
@@ -388,70 +360,55 @@ app.post('/api/owner/login', (req, res) => {
   if (!ADMIN_PASSWORD) {
     return res.status(500).json({
       success: false,
-      error: 'Owner login is not configured.'
+      error: 'Owner login is not configured. Set ADMIN_PASSWORD in Vercel.'
     });
   }
 
   const password = String(req.body.password || '');
 
   if (!safeEqual(password, ADMIN_PASSWORD)) {
-    return res.status(401).json({
-      success: false,
-      error: 'Incorrect password.'
-    });
+    return res.status(401).json({ success: false, error: 'Incorrect password.' });
   }
 
   const token = crypto.randomBytes(32).toString('hex');
   ownerTokens.add(token);
 
-  res.json({ success: true, token });
+  return res.json({ success: true, token });
 });
 
-// List appointments for owner dashboard
+// List appointments: canonical owner route
 app.get('/api/owner/appointments', requireOwner, async (req, res) => {
   try {
     const result = await sheetsRequest('list');
-    const appointments = (result.appointments || []).map(a => {
-      const normalized = normalizeAppointment(a);
-
-      return {
-        ...normalized,
-        dateText: displayDate(normalized.date),
-        timeText: displayTime(normalized.time)
-      };
-    });
-
-    res.json({ success: true, appointments });
+    res.json({ success: true, appointments: formatAppointments(result.appointments) });
   } catch (error) {
     publicError(res, error);
   }
 });
 
-// Approve or reject an appointment.
-// Response returns a WhatsApp link; it does not send a message automatically.
+// Legacy dashboard compatibility: GET /api/appointments
+app.get('/api/appointments', requireOwner, async (req, res) => {
+  try {
+    const result = await sheetsRequest('list');
+    res.json(formatAppointments(result.appointments));
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 async function updateAppointment(req, res, action) {
   try {
     const id = String(req.params.id || req.body.id || '').trim();
 
     if (!id) {
-      return res.status(400).json({
-        success: false,
-        error: 'Appointment ID is required.'
-      });
+      return res.status(400).json({ success: false, error: 'Appointment ID is required.' });
     }
 
     const result = await sheetsRequest(action, { id });
-
     const appointment = normalizeAppointment(result.appointment || {});
-
-    const message = appointmentMessage(
-      appointment,
-      action === 'approve'
-    );
-
     const customerWhatsAppLink = makeWhatsAppLink(
       appointment.phone,
-      message
+      appointmentMessage(appointment, action === 'approve')
     );
 
     res.json({
@@ -475,48 +432,54 @@ app.post('/api/owner/appointments/:id/approve', requireOwner,
 app.post('/api/owner/appointments/:id/reject', requireOwner,
   (req, res) => updateAppointment(req, res, 'reject'));
 
-// Also support clients that send the ID in the request body.
 app.post('/api/owner/approve', requireOwner,
   (req, res) => updateAppointment(req, res, 'approve'));
 
 app.post('/api/owner/reject', requireOwner,
   (req, res) => updateAppointment(req, res, 'reject'));
 
-// Delete an appointment
-app.delete('/api/owner/appointments/:id', requireOwner, async (req, res) => {
+// Legacy action route support
+app.post('/api/appointments/:id/approve', requireOwner,
+  (req, res) => updateAppointment(req, res, 'approve'));
+
+app.post('/api/appointments/:id/reject', requireOwner,
+  (req, res) => updateAppointment(req, res, 'reject'));
+
+async function deleteAppointment(req, res) {
   try {
-    const result = await sheetsRequest('delete', { id: req.params.id });
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'Appointment ID is required.' });
+    }
+
+    const result = await sheetsRequest('delete', { id });
     res.json({ success: true, ...result });
   } catch (error) {
     publicError(res, error);
   }
-});
+}
 
-app.post('/api/owner/appointments/:id/delete', requireOwner, async (req, res) => {
-  try {
-    const result = await sheetsRequest('delete', { id: req.params.id });
-    res.json({ success: true, ...result });
-  } catch (error) {
-    publicError(res, error);
-  }
-});
+app.delete('/api/owner/appointments/:id', requireOwner, deleteAppointment);
+app.post('/api/owner/appointments/:id/delete', requireOwner, deleteAppointment);
+app.delete('/api/appointments/:id', requireOwner, deleteAppointment);
 
-// Log out an owner session
+// Log out
 app.post('/api/owner/logout', requireOwner, (req, res) => {
   const token = String(req.headers.authorization || '').slice(7);
-  ownerTokens.delete(token);
+  if (token) ownerTokens.delete(token);
   res.json({ success: true });
 });
 
-// Fallback error handler
+// JSON 404 for unknown API paths
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, error: 'API route not found.' });
+});
+
+// Error handler
 app.use((err, req, res, next) => {
   console.error('Unhandled server error:', err);
   if (res.headersSent) return next(err);
-
-  res.status(500).json({
-    success: false,
-    error: 'Unexpected server error.'
-  });
+  res.status(500).json({ success: false, error: 'Unexpected server error.' });
 });
 
 if (require.main === module) {
