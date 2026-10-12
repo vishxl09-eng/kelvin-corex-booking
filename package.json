@@ -1,0 +1,14 @@
+{
+  "name": "kelvin-corex-booking",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Kelvin Corex responsive salon appointment booking app with Google Sheets storage",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}
