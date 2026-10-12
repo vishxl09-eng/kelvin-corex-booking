@@ -136,17 +136,83 @@ app.post('/api/appointments', async (req, res) => {
 
 app.post('/api/appointments/:id/:action', async (req, res) => {
   if (!adminOnly(req, res)) return;
+
   const action = req.params.action;
-  if (!['approve', 'reject'].includes(action)) return json(res, 404, { error: 'Action not found.' });
+  if (!['approve', 'reject'].includes(action)) {
+    return json(res, 404, { error: 'Action not found.' });
+  }
+
   try {
     const result = await sheets(action, { id: req.params.id });
-    if (!result.appointment) return json(res, 404, { error: 'Appointment not found.' });
+    if (!result.appointment) {
+      return json(res, 404, { error: 'Appointment not found.' });
+    }
+
     const a = result.appointment;
+
+    // Format date safely for display
+    const formatDate = (value) => {
+      const d = new Date(value);
+      if (isNaN(d.getTime())) return value;
+      return d.toLocaleDateString('en-IN', {
+        day: '2-digit',
+        month: 'long',
+        year: 'numeric',
+        timeZone: 'Asia/Kolkata'
+      });
+    };
+
+    // Handle Google Sheets time values
+    const formatTime = (value) => {
+      if (!value) return '';
+      if (typeof value === 'string' && value.includes('T')) {
+        const d = new Date(value);
+        if (!isNaN(d.getTime())) {
+          return d.toLocaleTimeString('en-IN', {
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true,
+            timeZone: 'UTC'
+          });
+        }
+      }
+      return value;
+    };
+
+    const date = formatDate(a.date);
+    const time = formatTime(a.time);
+
     const message = action === 'approve'
-      ? `Hi ${a.name}, your appointment at ${SALON_NAME} is CONFIRMED.\n\nService: ${a.service}\nDate: ${a.date}\nTime: ${a.time}\n\nThank you!`
-      : `Hi ${a.name}, unfortunately your appointment request at ${SALON_NAME} could not be confirmed.\n\nRequested: ${a.date} at ${a.time}\nPlease message us to choose another time.`;
-    return json(res, 200, { success: true, appointment: a, whatsappLink: waLink(a.phone, message) });
-  } catch (err) { return errorResponse(res, err); }
+      ? `Hi ${a.name},
+
+Your appointment at *${SALON_NAME}* is *CONFIRMED!* ✅
+
+*Service:* ${a.service}
+*Date:* ${date}
+*Time:* ${time}
+
+Thank you for choosing ${SALON_NAME}. We look forward to seeing you!
+
+*Team ${SALON_NAME}*`
+      : `Hi ${a.name},
+
+Unfortunately, your appointment request at *${SALON_NAME}* could not be confirmed.
+
+*Requested date:* ${date}
+*Requested time:* ${time}
+
+Please message us to arrange another suitable time.
+
+*Team ${SALON_NAME}*`;
+
+    return json(res, 200, {
+      success: true,
+      appointment: a,
+      whatsappLink: waLink(a.phone, message)
+    });
+  } catch (err) {
+    return errorResponse(res, err);
+  }
 });
 
 app.delete('/api/appointments/:id', async (req, res) => {
