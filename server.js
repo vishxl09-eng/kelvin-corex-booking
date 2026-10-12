@@ -1,469 +1,527 @@
 
+'use strict';
+
+require('dotenv').config();
+
 const express = require('express');
 const path = require('path');
-require('dotenv').config();
+const crypto = require('crypto');
 
 const app = express();
 
+const PORT = process.env.PORT || 3000;
 const SALON_NAME = process.env.SALON_NAME || 'Kelvin Corex';
-const OWNER_WHATSAPP = String(
-  process.env.OWNER_WHATSAPP || '8860947068'
-).replace(/\D/g, '');
+const OWNER_WHATSAPP = (process.env.OWNER_WHATSAPP || '8860947068')
+  .replace(/\D/g, '');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const OPEN_HOUR = Number(process.env.OPEN_HOUR || 10);
-const CLOSE_HOUR = Number(process.env.CLOSE_HOUR || 20);
 const SHEETS_WEB_APP_URL = process.env.SHEETS_WEB_APP_URL || '';
 const SHEETS_API_KEY = process.env.SHEETS_API_KEY || '';
+const OPEN_HOUR = Number(process.env.OPEN_HOUR || 10);
+const CLOSE_HOUR = Number(process.env.CLOSE_HOUR || 20);
 const PUBLIC_SITE_URL =
   process.env.PUBLIC_SITE_URL || 'https://kelvin-corex-booking.vercel.app';
 
+const TIMEZONE = 'Asia/Kolkata';
+
+// In-memory login tokens. On serverless hosting, sessions may reset
+// when an instance restarts; log in again if that happens.
+const ownerTokens = new Set();
+
 app.disable('x-powered-by');
-app.use(express.json({ limit: '20kb' }));
-app.use(express.urlencoded({ extended: false }));
-app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
+app.use(express.json({ limit: '30kb' }));
+app.use(express.urlencoded({ extended: false, limit: '30kb' }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-const json = (res, status, body) => res.status(status).json(body);
+function safeEqual(a, b) {
+  const first = Buffer.from(String(a));
+  const second = Buffer.from(String(b));
 
-function makeId() {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  return first.length === second.length &&
+    crypto.timingSafeEqual(first, second);
 }
 
-function normalizePhone(phone) {
-  let p = String(phone || '').replace(/\D/g, '');
-  if (p.length === 10) p = '91' + p;
-  return p;
-}
+function requireOwner(req, res, next) {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
 
-function isDate(date) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return false;
-
-  const d = new Date(`${date}T00:00:00Z`);
-
-  return !Number.isNaN(d.getTime()) &&
-    d.toISOString().slice(0, 10) === date;
-}
-
-function isTime(time) {
-  if (!/^\d{2}:\d{2}$/.test(String(time || ''))) return false;
-
-  const [h, m] = time.split(':').map(Number);
-
-  return h >= 0 && h <= 23 && m >= 0 && m <= 59;
-}
-
-function waLink(phone, message) {
-  return `https://wa.me/${encodeURIComponent(phone)}?text=${encodeURIComponent(message)}`;
-}
-
-/*
- * Format date values.
- * Date-only strings are handled without timezone conversion,
- * so the selected calendar day does not shift.
- */
-function formatDate(value) {
-  if (!value) return 'Not specified';
-
-  const raw = String(value).trim();
-  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
-
-  if (match) {
-    const [, year, month, day] = match;
-    const d = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
-
-    return d.toLocaleDateString('en-IN', {
-      day: '2-digit',
-      month: 'long',
-      year: 'numeric',
-      timeZone: 'UTC'
+  if (!token || !ownerTokens.has(token)) {
+    return res.status(401).json({
+      success: false,
+      error: 'Please log in as the salon owner.'
     });
   }
 
-  const d = value instanceof Date ? value : new Date(raw);
-
-  if (Number.isNaN(d.getTime())) return raw;
-
-  return d.toLocaleDateString('en-IN', {
-    day: '2-digit',
-    month: 'long',
-    year: 'numeric',
-    timeZone: 'Asia/Kolkata'
-  });
+  next();
 }
 
-/*
- * Format time values.
- * Preferred storage format is HH:mm, e.g. 18:30.
- * ISO timestamps are supported as a fallback.
- */
-function formatTime(value) {
-  if (value === null || value === undefined || value === '') {
-    return 'Not specified';
-  }
+function normalizeDate(value) {
+  if (value == null) return '';
 
-  const raw = String(value).trim();
+  const str = String(value).trim();
 
-  // Preferred value: "18:30" or "18:30:00"
-  const simple = raw.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  // The HTML date input sends YYYY-MM-DD. Preserve it as-is.
+  const match = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const check = new Date(Date.UTC(year, month - 1, day));
 
-  if (simple) {
-    const hour = Number(simple[1]);
-    const minute = Number(simple[2]);
-
-    if (hour <= 23 && minute <= 59) {
-      return new Date(Date.UTC(2000, 0, 1, hour, minute))
-        .toLocaleTimeString('en-IN', {
-          hour: 'numeric',
-          minute: '2-digit',
-          hour12: true,
-          timeZone: 'UTC'
-        });
+    if (
+      check.getUTCFullYear() === year &&
+      check.getUTCMonth() === month - 1 &&
+      check.getUTCDate() === day
+    ) {
+      return str;
     }
+    return '';
   }
 
-  /*
-   * Google Sheets may return a time-only cell as:
-   * 1899-12-30T18:30:00.000Z
-   *
-   * Read its encoded UTC clock time directly.
-   */
-  const sheetsTime = raw.match(
-    /^1899-12-30T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?Z?$/i
+  // For ISO timestamps, keep the date portion rather than shifting
+  // the calendar date through the server's local timezone.
+  const iso = str.match(/^(\d{4}-\d{2}-\d{2})T/);
+  if (iso) return normalizeDate(iso[1]);
+
+  // Handle legacy Google Sheets date serialization.
+  const legacy = str.match(/^(\d{4})-(\d{2})-(\d{2})\s/);
+  if (legacy) return normalizeDate(
+    `${legacy[1]}-${legacy[2]}-${legacy[3]}`
   );
 
-  if (sheetsTime) {
-    const hour = Number(sheetsTime[1]);
-    const minute = Number(sheetsTime[2]);
-
-    return new Date(Date.UTC(2000, 0, 1, hour, minute))
-      .toLocaleTimeString('en-IN', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-        timeZone: 'UTC'
-      });
-  }
-
-  /*
-   * Fallback for other ISO timestamps.
-   * This cannot recover the intended appointment time if
-   * Google Sheets has already stored the wrong time.
-   */
-  const iso = raw.match(/T(\d{2}):(\d{2})/);
-
-  if (iso) {
-    const hour = Number(iso[1]);
-    const minute = Number(iso[2]);
-
-    return new Date(Date.UTC(2000, 0, 1, hour, minute))
-      .toLocaleTimeString('en-IN', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-        timeZone: 'UTC'
-      });
-  }
-
-  return raw;
+  return '';
 }
 
-function adminOnly(req, res) {
-  if (!ADMIN_PASSWORD) {
-    json(res, 503, {
-      error: 'Owner login is not configured. Add ADMIN_PASSWORD in Vercel Environment Variables.'
-    });
-    return false;
+function normalizeTime(value) {
+  if (value == null) return '';
+
+  const str = String(value).trim();
+
+  // Preferred storage format: 14:00, 09:30, etc.
+  const twentyFour = str.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (twentyFour) {
+    const hour = Number(twentyFour[1]);
+    const minute = Number(twentyFour[2]);
+
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      return '';
+    }
+
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
   }
 
-  if (req.get('x-admin-password') !== ADMIN_PASSWORD) {
-    json(res, 401, {
-      error: 'Incorrect owner password. Please try again.'
-    });
-    return false;
+  // Handle legacy Sheets values such as 1899-12-30T14:00:00.000Z.
+  // This reads the clock portion only; it does not convert timezones.
+  const legacy = str.match(/^1899-12-30T(\d{2}):(\d{2})/);
+  if (legacy) return `${legacy[1]}:${legacy[2]}`;
+
+  // Handle strings such as 2:00 PM.
+  const twelve = str.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (twelve) {
+    let hour = Number(twelve[1]);
+    const minute = Number(twelve[2]);
+    const meridiem = twelve[3].toUpperCase();
+
+    if (hour < 1 || hour > 12 || minute > 59) return '';
+
+    if (meridiem === 'AM' && hour === 12) hour = 0;
+    if (meridiem === 'PM' && hour !== 12) hour += 12;
+
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
   }
 
-  return true;
+  return '';
 }
 
-async function sheets(action, payload = {}) {
+function displayDate(value) {
+  const dateStr = normalizeDate(value);
+  if (!dateStr) return 'Date unavailable';
+
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  return new Intl.DateTimeFormat('en-GB', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'UTC'
+  }).format(date);
+}
+
+function displayTime(value) {
+  const time = normalizeTime(value);
+  if (!time) return 'Time unavailable';
+
+  const [hour, minute] = time.split(':').map(Number);
+  const date = new Date(Date.UTC(2000, 0, 1, hour, minute));
+
+  return new Intl.DateTimeFormat('en-IN', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'UTC'
+  }).format(date).toLowerCase();
+}
+
+function normalizeAppointment(appointment) {
+  const a = appointment || {};
+
+  return {
+    ...a,
+    date: normalizeDate(a.date),
+    time: normalizeTime(a.time)
+  };
+}
+
+function makeWhatsAppLink(phone, message) {
+  const number = String(phone || '').replace(/\D/g, '');
+  if (!number) return '';
+
+  return `https://wa.me/${number}?text=${encodeURIComponent(message)}`;
+}
+
+function appointmentMessage(appointment, approved = true) {
+  const a = normalizeAppointment(appointment);
+
+  if (approved) {
+    return [
+      `Hi ${a.name || 'there'},`,
+      '',
+      `Your appointment at *${SALON_NAME}* is *CONFIRMED!* ✅`,
+      '',
+      `*Service:* ${a.service || 'Salon service'}`,
+      `*Date:* ${displayDate(a.date)}`,
+      `*Time:* ${displayTime(a.time)}`,
+      '',
+      `Thank you for choosing ${SALON_NAME}. We look forward to seeing you!`,
+      '',
+      `*Team ${SALON_NAME}*`
+    ].join('\n');
+  }
+
+  return [
+    `Hi ${a.name || 'there'},`,
+    '',
+    `Unfortunately, your appointment request at *${SALON_NAME}* could not be approved.`,
+    '',
+    `*Service:* ${a.service || 'Salon service'}`,
+    `*Date:* ${displayDate(a.date)}`,
+    `*Time:* ${displayTime(a.time)}`,
+    '',
+    'Please contact the salon to choose another available time.',
+    '',
+    `*Team ${SALON_NAME}*`
+  ].join('\n');
+}
+
+function ownerNotificationMessage(appointment) {
+  const a = normalizeAppointment(appointment);
+
+  return [
+    `New appointment request — ${SALON_NAME}`,
+    '',
+    `Name: ${a.name || ''}`,
+    `Phone: ${a.phone || ''}`,
+    `Service: ${a.service || ''}`,
+    `Date: ${displayDate(a.date)}`,
+    `Time: ${displayTime(a.time)}`,
+    '',
+    `Manage appointments: ${PUBLIC_SITE_URL}/owner.html`
+  ].join('\n');
+}
+
+async function sheetsRequest(action, data = {}) {
   if (!SHEETS_WEB_APP_URL || !SHEETS_API_KEY) {
-    const error = new Error(
-      'Booking storage is not configured. Add SHEETS_WEB_APP_URL and SHEETS_API_KEY in Vercel Environment Variables.'
-    );
-    error.status = 503;
-    throw error;
-  }
-
-  if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/.test(SHEETS_WEB_APP_URL)) {
-    const error = new Error(
-      'SHEETS_WEB_APP_URL must be the deployed Google Apps Script Web App URL ending in /exec.'
-    );
-    error.status = 503;
-    throw error;
+    throw new Error('Google Sheets connection is not configured.');
   }
 
   const response = await fetch(SHEETS_WEB_APP_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: JSON.stringify({
-      action,
       key: SHEETS_API_KEY,
-      ...payload
+      action,
+      ...data
     }),
-    redirect: 'follow'
+    signal: AbortSignal.timeout(15000)
   });
-
-  const raw = await response.text();
-  let data;
-
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    const error = new Error(
-      'Google Sheets returned a non-JSON response. Check Apps Script deployment access and the /exec URL.'
-    );
-    error.status = 502;
-    throw error;
-  }
-
-  if (data.error) {
-    const error = new Error(data.error);
-    error.status = /unauthorized/i.test(data.error) ? 401 : 400;
-    throw error;
-  }
 
   if (!response.ok) {
-    const error = new Error(`Google Sheets request failed (${response.status}).`);
-    error.status = 502;
-    throw error;
+    throw new Error(`Google Sheets returned HTTP ${response.status}.`);
   }
 
-  return data;
+  const result = await response.json();
+
+  if (result.error) throw new Error(result.error);
+
+  return result;
 }
 
-function errorResponse(res, err) {
-  console.error(
-    '[Kelvin Corex API]',
-    err && err.stack ? err.stack : err
-  );
-
-  return json(res, err.status || 500, {
-    error: err.message || 'Something went wrong. Please try again.'
+function publicError(res, error, status = 500) {
+  console.error(error);
+  return res.status(status).json({
+    success: false,
+    error: status === 500
+      ? 'Something went wrong. Please try again later.'
+      : String(error.message || error)
   });
 }
 
-app.get('/api/health', (_req, res) => {
-  json(res, 200, {
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({
     ok: true,
     salon: SALON_NAME,
-    storageConfigured: Boolean(SHEETS_WEB_APP_URL && SHEETS_API_KEY),
-    adminConfigured: Boolean(ADMIN_PASSWORD)
+    timezone: TIMEZONE
   });
 });
 
-app.get('/api/config', (_req, res) => {
-  json(res, 200, {
+// Public salon settings
+app.get('/api/config', (req, res) => {
+  res.json({
     salonName: SALON_NAME,
     openHour: OPEN_HOUR,
-    closeHour: CLOSE_HOUR
+    closeHour: CLOSE_HOUR,
+    timezone: TIMEZONE
   });
 });
 
-app.get('/api/appointments', async (req, res) => {
-  if (!adminOnly(req, res)) return;
-
-  try {
-    const result = await sheets('list');
-    const items = Array.isArray(result.appointments)
-      ? result.appointments
-      : [];
-
-    items.sort((a, b) =>
-      String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
-    );
-
-    return json(res, 200, items);
-  } catch (err) {
-    return errorResponse(res, err);
-  }
-});
-
+// Create a booking request
 app.post('/api/appointments', async (req, res) => {
   try {
-    const body = req.body || {};
+    const name = String(req.body.name || '').trim();
+    const phone = String(req.body.phone || '').replace(/\D/g, '');
+    const service = String(req.body.service || '').trim();
+    const date = normalizeDate(req.body.date);
+    const time = normalizeTime(req.body.time);
 
-    const name = String(body.name || '').trim().slice(0, 80);
-    const service = String(body.service || '').trim().slice(0, 80);
-    const date = String(body.date || '').trim();
-    const time = String(body.time || '').trim();
-    const phone = normalizePhone(body.phone);
-
-    if (!name || !service || !date || !time || !body.phone) {
-      return json(res, 400, {
-        error: 'Please complete every field.'
+    if (!name || name.length > 80) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please enter a valid name.'
       });
     }
 
-    if (!isDate(date) || !isTime(time)) {
-      return json(res, 400, {
-        error: 'Please choose a valid date and time.'
+    if (!/^(91)?[6-9]\d{9}$/.test(phone)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please enter a valid Indian mobile number.'
       });
     }
 
-    if (phone.length !== 12 || !phone.startsWith('91')) {
-      return json(res, 400, {
-        error: 'Enter a valid 10-digit Indian WhatsApp number.'
+    const allowedServices = [
+      'Haircut',
+      'Beard styling',
+      'Haircut + Beard',
+      'Hair styling',
+      'Other / consultation'
+    ];
+
+    if (!allowedServices.includes(service)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please select a valid service.'
       });
     }
 
+    if (!date || !time) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please select a valid date and time.'
+      });
+    }
+
+    const [year, month, day] = date.split('-').map(Number);
     const [hour, minute] = time.split(':').map(Number);
+    const requested = new Date(year, month - 1, day, hour, minute);
+    const now = new Date();
 
-    if (
-      hour < OPEN_HOUR ||
-      hour > CLOSE_HOUR ||
-      (hour === CLOSE_HOUR && minute > 0)
-    ) {
-      return json(res, 400, {
-        error: `Appointments are available from ${String(OPEN_HOUR).padStart(2, '0')}:00 to ${String(CLOSE_HOUR).padStart(2, '0')}:00.`
+    if (requested.getTime() < now.getTime()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please select a future date and time.'
       });
     }
 
-    // Interpret the selected date/time as India local time.
-    const chosen = new Date(`${date}T${time}:00+05:30`);
-
-    if (chosen.getTime() < Date.now() - 60000) {
-      return json(res, 400, {
-        error: 'Please choose a future date and time.'
+    if (hour < OPEN_HOUR || hour > CLOSE_HOUR ||
+        (hour === CLOSE_HOUR && minute > 0)) {
+      return res.status(400).json({
+        success: false,
+        error: `Appointments are available from ${displayTime(`${String(OPEN_HOUR).padStart(2, '0')}:00`)} to ${displayTime(`${String(CLOSE_HOUR).padStart(2, '0')}:00`)}.`
       });
     }
 
-    // Keep date and time as strings, not JavaScript Date objects.
     const appointment = {
-      id: makeId(),
+      id: crypto.randomUUID(),
       name,
-      phone,
+      phone: phone.length === 10 ? `91${phone}` : phone,
       service,
       date,
       time,
       status: 'pending',
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      updatedAt: ''
     };
 
-    const result = await sheets('create', { appointment });
-    const saved = result.appointment || appointment;
+    await sheetsRequest('create', { appointment });
 
-    const ownerMessage = `New appointment request — ${SALON_NAME}
+    const ownerLink = makeWhatsAppLink(
+      OWNER_WHATSAPP,
+      ownerNotificationMessage(appointment)
+    );
 
-Name: ${saved.name}
-Service: ${saved.service}
-Date: ${formatDate(saved.date)}
-Time: ${formatTime(saved.time)}
-WhatsApp: +${saved.phone}
-
-Dashboard: ${PUBLIC_SITE_URL}/owner.html`;
-
-    return json(res, 201, {
+    return res.status(201).json({
       success: true,
-      appointment: saved,
-      ownerWhatsAppLink: waLink(OWNER_WHATSAPP, ownerMessage)
+      appointment: {
+        ...appointment,
+        dateText: displayDate(date),
+        timeText: displayTime(time)
+      },
+      ownerWhatsAppLink: ownerLink
     });
-  } catch (err) {
-    return errorResponse(res, err);
+  } catch (error) {
+    return publicError(res, error);
   }
 });
 
-app.post('/api/appointments/:id/:action', async (req, res) => {
-  if (!adminOnly(req, res)) return;
-
-  const action = req.params.action;
-
-  if (!['approve', 'reject'].includes(action)) {
-    return json(res, 404, {
-      error: 'Action not found.'
+// Owner login
+app.post('/api/owner/login', (req, res) => {
+  if (!ADMIN_PASSWORD) {
+    return res.status(500).json({
+      success: false,
+      error: 'Owner login is not configured.'
     });
   }
 
+  const password = String(req.body.password || '');
+
+  if (!safeEqual(password, ADMIN_PASSWORD)) {
+    return res.status(401).json({
+      success: false,
+      error: 'Incorrect password.'
+    });
+  }
+
+  const token = crypto.randomBytes(32).toString('hex');
+  ownerTokens.add(token);
+
+  res.json({ success: true, token });
+});
+
+// List appointments for owner dashboard
+app.get('/api/owner/appointments', requireOwner, async (req, res) => {
   try {
-    const result = await sheets(action, {
-      id: req.params.id
+    const result = await sheetsRequest('list');
+    const appointments = (result.appointments || []).map(a => {
+      const normalized = normalizeAppointment(a);
+
+      return {
+        ...normalized,
+        dateText: displayDate(normalized.date),
+        timeText: displayTime(normalized.time)
+      };
     });
 
-    if (!result.appointment) {
-      return json(res, 404, {
-        error: 'Appointment not found.'
+    res.json({ success: true, appointments });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+// Approve or reject an appointment.
+// Response returns a WhatsApp link; it does not send a message automatically.
+async function updateAppointment(req, res, action) {
+  try {
+    const id = String(req.params.id || req.body.id || '').trim();
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Appointment ID is required.'
       });
     }
 
-    const appointment = result.appointment;
-    const date = formatDate(appointment.date);
-    const time = formatTime(appointment.time);
+    const result = await sheetsRequest(action, { id });
 
-    const message = action === 'approve'
-      ? `Hi ${appointment.name},
+    const appointment = normalizeAppointment(result.appointment || {});
 
-Your appointment at *${SALON_NAME}* is *CONFIRMED!* ✅
-
-*Service:* ${appointment.service}
-*Date:* ${date}
-*Time:* ${time}
-
-Thank you for choosing ${SALON_NAME}. We look forward to seeing you!
-
-*Team ${SALON_NAME}*`
-      : `Hi ${appointment.name},
-
-Unfortunately, your appointment request at *${SALON_NAME}* could not be confirmed.
-
-*Requested date:* ${date}
-*Requested time:* ${time}
-
-Please message us to arrange another suitable time.
-
-*Team ${SALON_NAME}*`;
-
-    return json(res, 200, {
-      success: true,
+    const message = appointmentMessage(
       appointment,
-      whatsappLink: waLink(appointment.phone, message)
+      action === 'approve'
+    );
+
+    const customerWhatsAppLink = makeWhatsAppLink(
+      appointment.phone,
+      message
+    );
+
+    res.json({
+      success: true,
+      appointment: {
+        ...appointment,
+        dateText: displayDate(appointment.date),
+        timeText: displayTime(appointment.time)
+      },
+      customerWhatsAppLink,
+      whatsappLink: customerWhatsAppLink
     });
-  } catch (err) {
-    return errorResponse(res, err);
+  } catch (error) {
+    publicError(res, error);
   }
-});
+}
 
-app.delete('/api/appointments/:id', async (req, res) => {
-  if (!adminOnly(req, res)) return;
+app.post('/api/owner/appointments/:id/approve', requireOwner,
+  (req, res) => updateAppointment(req, res, 'approve'));
 
+app.post('/api/owner/appointments/:id/reject', requireOwner,
+  (req, res) => updateAppointment(req, res, 'reject'));
+
+// Also support clients that send the ID in the request body.
+app.post('/api/owner/approve', requireOwner,
+  (req, res) => updateAppointment(req, res, 'approve'));
+
+app.post('/api/owner/reject', requireOwner,
+  (req, res) => updateAppointment(req, res, 'reject'));
+
+// Delete an appointment
+app.delete('/api/owner/appointments/:id', requireOwner, async (req, res) => {
   try {
-    await sheets('delete', {
-      id: req.params.id
-    });
-
-    return json(res, 200, {
-      success: true
-    });
-  } catch (err) {
-    return errorResponse(res, err);
+    const result = await sheetsRequest('delete', { id: req.params.id });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    publicError(res, error);
   }
 });
 
-app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api/')) {
-    return json(res, 404, {
-      error: 'API route not found.'
-    });
+app.post('/api/owner/appointments/:id/delete', requireOwner, async (req, res) => {
+  try {
+    const result = await sheetsRequest('delete', { id: req.params.id });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    publicError(res, error);
   }
+});
 
-  res.sendFile(
-    path.join(__dirname, 'public', 'index.html'),
-    err => err && next(err)
-  );
+// Log out an owner session
+app.post('/api/owner/logout', requireOwner, (req, res) => {
+  const token = String(req.headers.authorization || '').slice(7);
+  ownerTokens.delete(token);
+  res.json({ success: true });
+});
+
+// Fallback error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled server error:', err);
+  if (res.headersSent) return next(err);
+
+  res.status(500).json({
+    success: false,
+    error: 'Unexpected server error.'
+  });
 });
 
 if (require.main === module) {
-  const port = Number(process.env.PORT || 3000);
-
-  app.listen(port, () => {
-    console.log(`${SALON_NAME} running at http://localhost:${port}`);
+  app.listen(PORT, () => {
+    console.log(`${SALON_NAME} server running on port ${PORT}`);
   });
 }
 
